@@ -1,102 +1,121 @@
 #!/usr/bin/env ruby
 
 require 'bundler/setup'
-
-require 'net/https'
-require 'uri'
-require 'ruby_gntp'
 require 'nokogiri-plist'
+require 'terminal-notifier'
+
+require 'yaml/store'
+require 'net/https'
 require 'date'
 
-# Our last run
-# Setting this to epoch time in case this is our first time
-# or we don't have a last run file
-lastrun = Time.at(0).to_s
+class ReadingListToInstapaper
+  SETTINGS_PATH = File.expand_path('~/.readinglist_instapaper')
+  ICON_PATH = File.expand_path('./assets/instapaper.icns', __FILE__)
+  DEFAULT_SETTINGS = {
+    last_sync: Time.at(0),
+    username: nil,
+    password: nil,
+  }
 
-# Our last run file
-# Store it on dropbox if you want to have it sync across computers
-lastrun_file = "~/.readinglist_instapaper_run"
+  def self.sync
+    self.new.sync
+  end
 
-# If our timestamp file exists, read it in
-if (File.exists? File.expand_path(lastrun_file))
-  lastrun = File.open(File.expand_path(lastrun_file), 'rb').read
-end
+  def initialize
+    ensure_settings!
+  end
 
-# The real last run, which will either be epoch time
-# or the content of the last run file
-lastrun_dt = DateTime.parse(lastrun)
+  def sync
+    now = Time.now
 
-# Instapaper API stuff
-instapaper = 'www.instapaper.com'
-insta_user = 'your instapaper user'
-insta_pass = 'your instapaper pass'
+    latest_unread_reading_list_urls.each do |url|
+      if save_url_to_instapaper(url)
+        notify("Added to Instapaper", "Successfully added #{url}")
+      else
+        notify("Error Adding to Instapaper", "Could not add #{url}")
+      end
+    end
 
-# My Array of Links to send to Instapaper
-links = Array.new
+    save_last_sync(now)
+  end
 
-# Open the binary Bookmarks plist and convert to xml, read it in
-input = %x[/usr/bin/plutil -convert xml1 -o - ~/Library/Safari/Bookmarks.plist]
-# Let's parse the plist and find the elements we care about
-# There's probably a better way to do this, but I'm stupid at Ruby
-# This also seems ripe for refactoring, but I'm lazy
-plist = Nokogiri::PList(input)
-if plist.include? 'Children'
-  plist['Children'].each do |child|
-    child.keys.each do |ck|
-      if child[ck].is_a? Array
-        child[ck].each do |list|
-          if list.include? 'ReadingList'
-            datefetched = list['ReadingList']['DateAdded']
-            if (datefetched > lastrun_dt)
-              links << URI::escape(list['URLString'])
-            end
-          end
-        end
+  private
+  def latest_unread_reading_list_urls
+    bookmark_categories = safari_bookmarks_plist['Children']
+    reading_list        = bookmark_categories.find { |c| c['Title'] == 'com.apple.ReadingList' }
+
+    reading_list['Children']
+      .reject { |b| b['ReadingList'].has_key?('DateLastViewed') }           # unread
+      .select { |b| b['ReadingList']['DateAdded'] }                         # double check
+      .select { |b| b['ReadingList']['DateAdded'] > last_sync.to_datetime } # filter synced
+      .sort   { |b| b['ReadingList']['DateAdded'] }
+      .map    { |b| b['URLString'] }
+  end
+
+  def safari_bookmarks_plist
+    file_content = %x[/usr/bin/plutil -convert xml1 -o - ~/Library/Safari/Bookmarks.plist]
+    Nokogiri::PList(file_content)
+  end
+
+  def save_url_to_instapaper(url)
+    Net::HTTP.start('www.instapaper.com', 443, use_ssl: true, verify_mode: OpenSSL::SSL::VERIFY_PEER) do |http|
+      request = Net::HTTP::Get.new("/api/add?url=#{URI::escape(url)}")
+      request.basic_auth(username, password)
+      response = http.request(request)
+
+      print "Saving '#{url}' to Instapaper..."
+      response.is_a?(Net::HTTPSuccess).tap do |success|
+        puts(success ? "\tcompleted" : "\tfailed")
       end
     end
   end
-end
 
+  def username
+    settings.fetch(:username) { raise 'Username required for syncing' }
+  end
 
+  def password
+    settings.fetch(:password) { raise 'Password required for syncing' }
+  end
 
-# Let's loop through our links and add them to instapaper
-links.each do |url|
-  http = Net::HTTP.new(instapaper, 443)
-  http.use_ssl = true
-  http.verify_mode = OpenSSL::SSL::VERIFY_PEER
-  query_string = "/api/add?url=#{url}"
-  request = Net::HTTP::Get.new(query_string)
-  request.basic_auth(insta_user, insta_pass)
-  response = http.request(request)
+  def last_sync
+    settings[:last_sync] || DEFAULT_SETTINGS[:last_sync]
+  end
 
-  # Throw up a growl message
-  # The icon stuff doesn't work. Not sure why yet
-  if ( response.code == '201' )
-    begin
-    GNTP.notify({
-      :app_name => "Instapaper",
-      :title    => "Added to Instapaper",
-      :text     => "Successfully added #{url}",
-      :icon     => "http://www.instapaper.com/apple-touch-icon.png",
-    })
-    rescue Errno::ECONNREFUSED
-    end
-  else
-    begin
-    GNTP.notify({
-      :app_name => "Instapaper",
-      :title    => "Error Adding to Instapaper",
-      :text     => "Could not add #{url}",
-      :icon     => "http://www.instapaper.com/apple-touch-icon.png",
-    })
-    rescue Errno::ECONNREFUSED
+  def save_last_sync(time = nil)
+    settings_file.transaction do |s|
+      s[:settings][:last_sync] = time || Time.now
     end
   end
+
+  def notify(subtitle, message)
+    TerminalNotifier.notify(
+      message,
+      title: "Instapaper",
+      subtitle: subtitle,
+      appIcon: ICON_PATH,
+    )
+  end
+
+  def settings
+    settings_file.transaction(:read_only) { |c| c[:settings] || {} }
+  end
+
+  def settings_file
+    YAML::Store.new(SETTINGS_PATH)
+  end
+
+  def ensure_settings!
+    settings_file.transaction do |c|
+      unless c[:settings]
+        c[:settings] = DEFAULT_SETTINGS
+        puts "Please add your Instapaper credentials in #{SETTINGS_PATH} file!"
+      end
+    end
+  end
+
 end
 
-# Let's write our successful run out
-# Only write out when we have links, so that we don't save a file every
-# time a bookmark changes
-if ( links.length > 0 )
-  File.open(File.expand_path(lastrun_file), 'w') {|f| f.write(DateTime.now.to_s) }
+if __FILE__ == $0
+  ReadingListToInstapaper.sync
 end
