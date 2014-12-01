@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+ENV['BUNDLE_GEMFILE'] = File.expand_path('../Gemfile', __FILE__)
 
 require 'bundler/setup'
 require 'nokogiri-plist'
@@ -28,7 +29,8 @@ class ReadingListToInstapaper
   def sync
     now = Time.now
 
-    latest_unread_reading_list_urls.each do |url|
+    urls = latest_unread_reading_list_urls
+    urls.each do |url|
       if save_url_to_instapaper(url)
         notify("Added to Instapaper", "Successfully added #{url}")
       else
@@ -36,6 +38,7 @@ class ReadingListToInstapaper
       end
     end
 
+    puts 'Not link to transfer.' if urls.empty?
     save_last_sync(now)
   end
 
